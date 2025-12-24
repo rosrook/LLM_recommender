@@ -34,6 +34,8 @@ class Trainer:
             self.num_gpus = torch.cuda.device_count()
             if self.num_gpus > 1:
                 print(f"✓ 检测到 {self.num_gpus} 张GPU，将使用 DataParallel 进行多GPU训练")
+                # 显示GPU显存信息
+                self._print_gpu_memory_info()
                 # 将模型移到主GPU
                 self.model = model.to(device)
                 # 使用 DataParallel 包装模型
@@ -76,6 +78,21 @@ class Trainer:
         self.eval_loss_dict = defaultdict(list)
         self.best_model_path = None
         self.wait_epochs = 0
+    
+    def _print_gpu_memory_info(self):
+        """打印GPU显存信息"""
+        if torch.cuda.is_available():
+            print("\nGPU显存信息:")
+            for i in range(self.num_gpus):
+                props = torch.cuda.get_device_properties(i)
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                total = props.total_memory / 1024**3
+                print(f"  GPU {i} ({props.name}): "
+                      f"已分配 {allocated:.2f}GB / "
+                      f"已保留 {reserved:.2f}GB / "
+                      f"总计 {total:.2f}GB")
+            print()
 
     def _train_epoch(self):
         """Train model for one epoch"""
@@ -94,29 +111,53 @@ class Trainer:
             users, pos_items, neg_items = batch
             data_loading_time += time() - batch_start
 
-            # Forward pass
-            forward_start = time()
-            pos_scores, neg_scores = self.model(batch)
-            forward_time += time() - forward_start
+            try:
+                # Forward pass
+                forward_start = time()
+                pos_scores, neg_scores = self.model(batch)
+                forward_time += time() - forward_start
 
-            # Loss computation and backward pass
-            backward_start = time()
-            # Use model's calculate_loss method if available, otherwise use default BPR loss
-            if hasattr(self.model, 'calculate_loss'):
-                loss = self.model.calculate_loss(pos_scores, neg_scores)
-            else:
-                loss = -(pos_scores - neg_scores).sigmoid().log().mean()
-            backward_time += time() - backward_start
+                # Loss computation and backward pass
+                backward_start = time()
+                # Use model's calculate_loss method if available, otherwise use default BPR loss
+                if hasattr(self.model, 'calculate_loss'):
+                    loss = self.model.calculate_loss(pos_scores, neg_scores)
+                else:
+                    loss = -(pos_scores - neg_scores).sigmoid().log().mean()
+                backward_time += time() - backward_start
 
-            # Optimizer step
-            optimizer_start = time()
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            optimizer_time += time() - optimizer_start
+                # Optimizer step
+                optimizer_start = time()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                optimizer_time += time() - optimizer_start
 
-            total_loss += loss.item() * len(users)
-            total_samples += len(users)
+                total_loss += loss.item() * len(users)
+                total_samples += len(users)
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "CUDA out of memory" in str(e):
+                    # 显存不足错误处理
+                    print(f"\n⚠️ 显存不足错误！当前batch size: {len(users)}")
+                    print("建议解决方案：")
+                    print("  1. 减少batch_size（推荐）")
+                    print("  2. 使用动态模式（use_cache=False）")
+                    print("  3. 使用更少的GPU（设置CUDA_VISIBLE_DEVICES）")
+                    print("  4. 使用梯度累积（gradient_accumulation_steps）")
+                    
+                    # 清理显存
+                    torch.cuda.empty_cache()
+                    
+                    # 重新抛出错误，让用户决定如何处理
+                    raise RuntimeError(
+                        f"GPU显存不足。当前batch size: {len(users)}, "
+                        f"GPU数量: {self.num_gpus}。"
+                        f"建议：将batch_size减少到 {len(users) // 2} 或更小。"
+                    ) from e
+                else:
+                    # 其他运行时错误，直接抛出
+                    raise
 
         # Log time costs
         # print(

@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "NFC",
+			"path": "."
+		},
+		{
+			"name": "ml-1m",
+			"path": "../ml-1m"
+		}
+	],
+	"settings": {}
+}

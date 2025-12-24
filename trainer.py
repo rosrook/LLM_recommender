@@ -95,6 +95,10 @@ class Trainer:
             'no_decrease_epochs': 10,  # 连续多少epoch不下降才报警
             'rising_threshold': 0.001  # loss上升阈值（超过此值才认为是真正上升）
         }
+        
+        # 梯度监测配置
+        self.grad_norm_history = []  # 记录梯度范数历史
+        self.score_stats_history = []  # 记录模型输出统计信息
     
     def _print_gpu_memory_info(self):
         """打印GPU显存信息"""

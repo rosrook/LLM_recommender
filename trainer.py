@@ -25,7 +25,12 @@ class Trainer:
             early_stop_patience=10,
             use_multi_gpu=True,  # 是否自动使用多GPU
             max_grad_norm=1.0,   # 梯度裁剪阈值
-            enable_grad_clip=True  # 是否启用梯度裁剪
+            enable_grad_clip=True,  # 是否启用梯度裁剪
+            use_lr_scheduler=True,  # 是否使用学习率调度器
+            scheduler_mode='min',  # 'min'表示监控loss（越小越好），'max'表示监控指标（越大越好）
+            scheduler_factor=0.5,  # 学习率衰减因子
+            scheduler_patience=3,  # 多少个epoch不改善就减小学习率
+            scheduler_min_lr=1e-6  # 最小学习率
     ):
         # 检测并设置设备
         self.device = device
@@ -72,6 +77,27 @@ class Trainer:
             self.optimizer = optim.SGD(model_for_optimizer.parameters(), lr=lr, weight_decay=weight_decay)
         else:
             raise ValueError(f"Optimizer {optimizer} not supported")
+        
+        # Setup learning rate scheduler
+        self.use_lr_scheduler = use_lr_scheduler
+        if use_lr_scheduler:
+            # 使用ReduceLROnPlateau：当验证指标不再改善时自动减小学习率
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode=scheduler_mode,
+                factor=scheduler_factor,  # 每次减小到原来的factor倍
+                patience=scheduler_patience,  # 等待patience个epoch
+                min_lr=scheduler_min_lr,  # 最小学习率
+                verbose=True  # 打印学习率变化
+            )
+            print(f"✓ 已启用学习率调度器:")
+            print(f"   模式: {scheduler_mode} (监控{'loss' if scheduler_mode == 'min' else '指标'})")
+            print(f"   衰减因子: {scheduler_factor} (每次减小到原来的{scheduler_factor}倍)")
+            print(f"   耐心值: {scheduler_patience} (等待{scheduler_patience}个epoch不改善)")
+            print(f"   最小学习率: {scheduler_min_lr}")
+            print(f"   初始学习率: {lr}")
+        else:
+            self.scheduler = None
 
         # Training records
         self.best_valid_score = -np.inf
@@ -684,6 +710,28 @@ class Trainer:
                     if self.wait_epochs >= self.early_stop_patience:
                         self.logger.info("Early stopping triggered")
                         break
+                
+                # 更新学习率调度器
+                if self.use_lr_scheduler and self.scheduler is not None:
+                    # 根据scheduler_mode决定监控的值
+                    if self.scheduler.mode == 'max':
+                        # 监控验证指标（越大越好）
+                        monitor_value = metric
+                    else:
+                        # 监控训练loss（越小越好）
+                        monitor_value = train_loss
+                    
+                    # 获取当前学习率
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    
+                    # 更新调度器
+                    self.scheduler.step(monitor_value)
+                    
+                    # 检查学习率是否变化
+                    new_lr = self.optimizer.param_groups[0]['lr']
+                    if new_lr < current_lr:
+                        print(f"\n  ✓ 学习率已调整: {current_lr:.2e} -> {new_lr:.2e} "
+                              f"(监控值: {monitor_value:.4f})")
                 # # Save best model
                 # if valid_result["NDCG@10"] > self.best_valid_score:
                 #     self.best_valid_score = valid_result["NDCG@10"]

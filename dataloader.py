@@ -86,11 +86,12 @@ class TrainDataLoader(AbstractDataLoader):
         cur_slice = slice(self.pr, self.pr + self.step)
         self.pr += self.step
 
-        return torch.stack([
+        # 返回元组格式，兼容 DataParallel
+        return (
             self.user_tensor[cur_slice],
             self.item_tensor[cur_slice],
             self.neg_items[cur_slice]
-        ])
+        )
 
     def _get_history_items_u(self):
         """Build dictionary of items interacted by each user"""

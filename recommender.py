@@ -294,7 +294,8 @@ class GPT2Recommender(AbstractRecommender):
         Forward pass to compute prediction scores
         
         Args:
-            batch_data (torch.Tensor): Batch data containing [users, pos_items, neg_items]
+            batch_data (tuple): Batch data tuple containing (users, pos_items, neg_items)
+                               Each element is a torch.Tensor of shape (batch_size,)
             
         Returns:
             tuple: (pos_scores, neg_scores) predicted scores for positive and negative samples

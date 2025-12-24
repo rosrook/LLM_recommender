@@ -145,6 +145,13 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
         if self.metadata_dim != embed_dim:
             self.user_meta_proj = nn.Linear(self.metadata_dim, embed_dim)
             self.item_meta_proj = nn.Linear(self.metadata_dim, embed_dim)
+            # 初始化projection层
+            nn.init.xavier_uniform_(self.user_meta_proj.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.item_meta_proj.weight, gain=0.1)
+            if self.user_meta_proj.bias is not None:
+                nn.init.constant_(self.user_meta_proj.bias, 0.0)
+            if self.item_meta_proj.bias is not None:
+                nn.init.constant_(self.item_meta_proj.bias, 0.0)
         else:
             self.user_meta_proj = nn.Identity()
             self.item_meta_proj = nn.Identity()
@@ -153,6 +160,8 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
         if use_attention:
             self.user_fusion = CrossAttentionFusion(embed_dim, num_heads=4)
             self.item_fusion = CrossAttentionFusion(embed_dim, num_heads=4)
+            # 初始化attention fusion层
+            self._init_attention_weights()
             fusion_output_dim = embed_dim * 2  # After fusion, we concatenate user and item
         else:
             self.user_fusion = None
@@ -160,6 +169,8 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
             fusion_output_dim = embed_dim * 4  # Simple concatenation
         
         # MLP layers for prediction
+        # 注意：BPR loss需要原始分数，不需要Sigmoid
+        # Sigmoid会压缩输出范围，导致模型无法学习
         self.mlp_layers = nn.Sequential(
             nn.Linear(fusion_output_dim, embed_dim * 2),
             nn.ReLU(),
@@ -167,9 +178,12 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
             nn.Linear(embed_dim * 2, embed_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(embed_dim, 1),
-            nn.Sigmoid()  # Output between 0 and 1
+            nn.Linear(embed_dim, 1)
+            # 移除Sigmoid：BPR loss期望原始分数，sigmoid会限制学习
         )
+        
+        # 初始化MLP层：使用更小的初始化范围，避免初始输出过大
+        self._init_mlp_weights()
         
         # Contrastive learning projection head
         self.contrastive_proj = nn.Sequential(
@@ -182,6 +196,31 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
         if freeze_gpt2:
             for param in self.gpt2_encoder.parameters():
                 param.requires_grad = False
+    
+    def _init_mlp_weights(self):
+        """Initialize MLP weights with smaller range to avoid large initial outputs"""
+        for module in self.mlp_layers:
+            if isinstance(module, nn.Linear):
+                # 使用Xavier uniform初始化，但限制范围
+                nn.init.xavier_uniform_(module.weight, gain=0.1)  # 较小的gain
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+        
+        # 特别初始化最后一层，使其输出接近0
+        if isinstance(self.mlp_layers[-1], nn.Linear):
+            nn.init.xavier_uniform_(self.mlp_layers[-1].weight, gain=0.01)  # 非常小的gain
+            if self.mlp_layers[-1].bias is not None:
+                nn.init.constant_(self.mlp_layers[-1].bias, 0.0)
+    
+    def _init_attention_weights(self):
+        """Initialize attention fusion layers with smaller weights"""
+        for fusion in [self.user_fusion, self.item_fusion]:
+            if fusion is not None:
+                for module in fusion.modules():
+                    if isinstance(module, nn.Linear):
+                        nn.init.xavier_uniform_(module.weight, gain=0.1)
+                        if module.bias is not None:
+                            nn.init.constant_(module.bias, 0.0)
     
     def _cache_metadata_texts(self):
         """Cache formatted metadata texts for faster access"""
@@ -308,28 +347,35 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
     
     def calculate_loss(self, pos_scores, neg_scores):
         """
-        Calculate combined BPR loss and contrastive loss
+        Calculate BPR loss
         
         Args:
-            pos_scores (torch.FloatTensor): Predicted scores for positive samples
-            neg_scores (torch.FloatTensor): Predicted scores for negative samples
+            pos_scores (torch.FloatTensor): Predicted scores for positive samples (shape: [batch_size, 1])
+            neg_scores (torch.FloatTensor): Predicted scores for negative samples (shape: [batch_size, 1])
             
         Returns:
-            torch.FloatTensor: Combined loss value
+            torch.FloatTensor: BPR loss value
         """
-        # BPR loss
+        # 确保scores是1D tensor
+        if pos_scores.dim() > 1:
+            pos_scores = pos_scores.squeeze()
+        if neg_scores.dim() > 1:
+            neg_scores = neg_scores.squeeze()
+        
+        # BPR loss: -log(sigmoid(pos_score - neg_score))
+        # 这个loss鼓励pos_score > neg_score
         diff = pos_scores - neg_scores
+        # 使用更稳定的计算方式，避免数值问题
         bpr_loss = -torch.log(torch.sigmoid(diff) + 1e-10).mean()
         
-        # Optional: Add contrastive loss for semantic alignment
-        # This encourages similar users/items to have similar embeddings
-        if self.contrastive_weight > 0 and self.training:
-            # Simple contrastive loss: maximize pos_score, minimize neg_score
-            contrastive_loss = -torch.log(torch.sigmoid(pos_scores) + 1e-10).mean() + \
-                              torch.log(torch.sigmoid(neg_scores) + 1e-10).mean()
-            total_loss = bpr_loss + self.contrastive_weight * contrastive_loss
-        else:
-            total_loss = bpr_loss
+        # 暂时禁用contrastive loss，因为它可能导致训练不稳定
+        # 如果以后需要，可以重新启用并调整权重
+        # if self.contrastive_weight > 0 and self.training:
+        #     contrastive_loss = -torch.log(torch.sigmoid(pos_scores) + 1e-10).mean() + \
+        #                       torch.log(torch.sigmoid(neg_scores) + 1e-10).mean()
+        #     total_loss = bpr_loss + self.contrastive_weight * contrastive_loss
+        # else:
+        total_loss = bpr_loss
         
         return total_loss
     

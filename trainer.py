@@ -23,7 +23,9 @@ class Trainer:
             weight_decay=0,
             eval_step=1,
             early_stop_patience=10,
-            use_multi_gpu=True  # 是否自动使用多GPU
+            use_multi_gpu=True,  # 是否自动使用多GPU
+            max_grad_norm=1.0,   # 梯度裁剪阈值
+            enable_grad_clip=True  # 是否启用梯度裁剪
     ):
         # 检测并设置设备
         self.device = device
@@ -79,6 +81,10 @@ class Trainer:
         self.best_model_path = None
         self.wait_epochs = 0
         
+        # 梯度裁剪配置
+        self.max_grad_norm = max_grad_norm
+        self.enable_grad_clip = enable_grad_clip
+        
         # Loss监测配置
         self.loss_history = []  # 记录loss历史，用于检测异常
         self.loss_anomaly_threshold = {
@@ -86,7 +92,8 @@ class Trainer:
             'min_loss': 0.0,       # 最小loss阈值（BPR loss应该是正数）
             'nan_check': True,     # 检查NaN
             'inf_check': True,     # 检查Inf
-            'no_decrease_epochs': 10  # 连续多少epoch不下降才报警
+            'no_decrease_epochs': 10,  # 连续多少epoch不下降才报警
+            'rising_threshold': 0.001  # loss上升阈值（超过此值才认为是真正上升）
         }
     
     def _print_gpu_memory_info(self):
@@ -219,6 +226,115 @@ class Trainer:
             print("\n" + "\n".join(error_messages))
             # 不抛出异常，只警告
     
+    def _monitor_and_clip_gradients(self, batch_idx):
+        """
+        监测和裁剪梯度
+        
+        Args:
+            batch_idx: batch索引
+        
+        Returns:
+            float: 梯度范数
+        """
+        # 获取模型参数（处理DataParallel）
+        if self.use_multi_gpu:
+            model = self.model.module
+        else:
+            model = self.model
+        
+        # 计算梯度范数
+        total_norm = 0.0
+        param_count = 0
+        for param in model.parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        
+        if param_count > 0:
+            total_norm = total_norm ** (1. / 2)
+        else:
+            total_norm = 0.0
+        
+        # 检查梯度爆炸
+        if total_norm > 100.0:  # 梯度范数超过100认为可能爆炸
+            if batch_idx == 0 or batch_idx % 50 == 0:  # 每50个batch或第一个batch提示
+                print(f"\n  ⚠️  警告：梯度范数异常大！")
+                print(f"     当前梯度范数: {total_norm:.4f} (阈值: 100.0)")
+                print(f"     Batch索引: {batch_idx}")
+                print(f"     可能原因：梯度爆炸，学习率太大")
+                print(f"     建议：减小学习率或启用梯度裁剪")
+        
+        # 梯度裁剪
+        if self.enable_grad_clip and total_norm > self.max_grad_norm:
+            # DataParallel和单GPU都使用相同的方法（因为我们已经获取了module）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
+            
+            if batch_idx == 0 or batch_idx % 100 == 0:  # 每100个batch提示一次
+                print(f"\n  ✓ 已应用梯度裁剪: {total_norm:.4f} -> {self.max_grad_norm}")
+        
+        return total_norm
+    
+    def _check_model_outputs(self, pos_scores, neg_scores, batch_idx):
+        """
+        检查模型输出是否正常
+        
+        Args:
+            pos_scores: 正样本分数
+            neg_scores: 负样本分数
+            batch_idx: batch索引
+        """
+        with torch.no_grad():
+            pos_mean = pos_scores.mean().item()
+            neg_mean = neg_scores.mean().item()
+            pos_std = pos_scores.std().item()
+            neg_std = neg_scores.std().item()
+            diff_mean = (pos_scores - neg_scores).mean().item()
+            
+            # 记录统计信息
+            stats = {
+                'pos_mean': pos_mean,
+                'neg_mean': neg_mean,
+                'pos_std': pos_std,
+                'neg_std': neg_std,
+                'diff_mean': diff_mean,
+                'batch_idx': batch_idx
+            }
+            self.score_stats_history.append(stats)
+            
+            # 检查异常情况
+            warnings = []
+            
+            # 检查1: pos_score是否小于neg_score（这是不正常的）
+            if pos_mean < neg_mean:
+                warnings.append(f"⚠️  异常：正样本分数({pos_mean:.4f}) < 负样本分数({neg_mean:.4f})")
+                warnings.append(f"     这意味着模型预测错误，loss会持续上升")
+                warnings.append(f"     可能原因：")
+                warnings.append(f"       1. 模型初始化问题")
+                warnings.append(f"       2. 学习率太大，导致模型无法学习正确方向")
+                warnings.append(f"       3. 数据标签问题")
+            
+            # 检查2: 分数差异是否太小
+            if diff_mean < 0.1:
+                warnings.append(f"⚠️  警告：正负样本分数差异很小({diff_mean:.4f})")
+                warnings.append(f"     模型可能无法区分正负样本")
+            
+            # 检查3: 分数是否在合理范围内（BPR通常期望分数在合理范围）
+            if pos_mean < -10 or pos_mean > 10:
+                warnings.append(f"⚠️  警告：正样本分数异常({pos_mean:.4f})，可能超出合理范围")
+            
+            if neg_mean < -10 or neg_mean > 10:
+                warnings.append(f"⚠️  警告：负样本分数异常({neg_mean:.4f})，可能超出合理范围")
+            
+            # 输出警告
+            if warnings:
+                print(f"\n  Batch {batch_idx} 模型输出检查：")
+                print(f"    正样本分数: mean={pos_mean:.4f}, std={pos_std:.4f}")
+                print(f"    负样本分数: mean={neg_mean:.4f}, std={neg_std:.4f}")
+                print(f"    分数差异: {diff_mean:.4f}")
+                for warning in warnings:
+                    print(f"    {warning}")
+    
     def _check_epoch_loss_trend(self):
         """检查epoch级别的loss趋势"""
         if len(self.loss_history) < self.loss_anomaly_threshold['no_decrease_epochs']:
@@ -245,12 +361,55 @@ class Trainer:
             print(f"     - 检查验证集指标是否提升")
             print(f"     - 如果验证集指标也不提升，考虑调整超参数")
         
-        # 检查loss是否持续上升
-        if len(loss_changes) >= 3 and all(change > 0 for change in loss_changes[-3:]):
+        # 检查loss是否持续上升（使用阈值避免微小波动误报）
+        threshold = self.loss_anomaly_threshold['rising_threshold']
+        recent_changes = loss_changes[-3:] if len(loss_changes) >= 3 else loss_changes
+        if len(recent_changes) >= 3 and all(change > threshold for change in recent_changes):
             print(f"\n⚠️  警告：Loss持续上升！")
-            print(f"   最近3个epoch的loss变化: {[f'{c:+.4f}' for c in loss_changes[-3:]]}")
-            print(f"   可能原因：学习率太大，导致训练不稳定")
-            print(f"   建议：减小学习率（当前: {self.optimizer.param_groups[0]['lr']}）")
+            print(f"   最近3个epoch的loss: {[f'{l:.6f}' for l in recent_losses[-3:]]}")
+            print(f"   Loss变化: {[f'{c:+.6f}' for c in recent_changes]}")
+            
+            # 检查梯度范数
+            if len(self.grad_norm_history) > 0:
+                recent_grad_norms = self.grad_norm_history[-100:]  # 最近100个batch
+                avg_grad_norm = np.mean(recent_grad_norms)
+                max_grad_norm = np.max(recent_grad_norms)
+                print(f"   梯度范数: 平均={avg_grad_norm:.4f}, 最大={max_grad_norm:.4f}")
+                if max_grad_norm > 100.0:
+                    print(f"   ⚠️  检测到梯度爆炸！最大梯度范数: {max_grad_norm:.4f}")
+            
+            # 检查模型输出统计
+            if len(self.score_stats_history) > 0:
+                recent_stats = self.score_stats_history[-10:]  # 最近10次检查
+                avg_pos_mean = np.mean([s['pos_mean'] for s in recent_stats])
+                avg_neg_mean = np.mean([s['neg_mean'] for s in recent_stats])
+                avg_diff = np.mean([s['diff_mean'] for s in recent_stats])
+                print(f"   模型输出统计（最近10次检查）:")
+                print(f"     正样本分数均值: {avg_pos_mean:.4f}")
+                print(f"     负样本分数均值: {avg_neg_mean:.4f}")
+                print(f"     分数差异均值: {avg_diff:.4f}")
+                if avg_pos_mean < avg_neg_mean:
+                    print(f"   ❌ 严重：正样本分数 < 负样本分数，这是导致loss上升的根本原因！")
+            
+            print(f"   可能原因：")
+            print(f"     1. 学习率太大，导致训练不稳定")
+            print(f"     2. 梯度爆炸（检查梯度范数）")
+            print(f"     3. 模型输出异常（pos_score < neg_score）")
+            print(f"   建议：")
+            print(f"     - 减小学习率（当前: {self.optimizer.param_groups[0]['lr']}）")
+            print(f"     - 检查是否已启用梯度裁剪（当前: {self.enable_grad_clip}）")
+            print(f"     - 如果持续上升，考虑暂停训练并检查模型")
+            
+            # 如果loss上升很严重，提供自动调整建议
+            avg_rise = np.mean(recent_changes)
+            if avg_rise > 0.01:  # 平均每个epoch上升超过0.01
+                print(f"\n   ⚠️  严重：Loss平均每个epoch上升 {avg_rise:.6f}")
+                print(f"   建议立即采取行动：")
+                suggested_lr = self.optimizer.param_groups[0]['lr'] * 0.5
+                print(f"     1. 减小学习率到 {suggested_lr:.6f}（当前的一半）")
+                print(f"     2. 确保梯度裁剪已启用（max_grad_norm={self.max_grad_norm}）")
+                print(f"     3. 检查模型输出范围（见上面的统计信息）")
+                print(f"     4. 如果问题持续，考虑重新初始化模型或使用更小的学习率")
 
     def _train_epoch(self):
         """Train model for one epoch"""
@@ -312,8 +471,10 @@ class Trainer:
                 # Loss computation and backward pass
                 backward_start = time()
                 # Use model's calculate_loss method if available, otherwise use default BPR loss
-                if hasattr(self.model, 'calculate_loss'):
-                    loss = self.model.calculate_loss(pos_scores, neg_scores)
+                # 处理DataParallel：需要访问module
+                model_for_loss = self.model.module if self.use_multi_gpu else self.model
+                if hasattr(model_for_loss, 'calculate_loss'):
+                    loss = model_for_loss.calculate_loss(pos_scores, neg_scores)
                 else:
                     loss = -(pos_scores - neg_scores).sigmoid().log().mean()
                 backward_time += time() - backward_start
@@ -322,6 +483,15 @@ class Trainer:
                 optimizer_start = time()
                 self.optimizer.zero_grad()
                 loss.backward()
+                
+                # 梯度监测和裁剪
+                grad_norm = self._monitor_and_clip_gradients(batch_idx)
+                self.grad_norm_history.append(grad_norm)
+                
+                # 检查模型输出（pos_score vs neg_score）
+                if batch_idx == 0 or batch_idx % 100 == 0:  # 每100个batch检查一次
+                    self._check_model_outputs(pos_scores, neg_scores, batch_idx)
+                
                 self.optimizer.step()
                 optimizer_time += time() - optimizer_start
 

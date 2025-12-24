@@ -77,10 +77,12 @@ trainer = Trainer(
     test_data=test_loader,
     device=DEVICE,
     epochs=15,
-    lr=1e-3,
+    lr=1e-4,  # 降低学习率：从1e-3降到1e-4，避免训练不稳定
     weight_decay=1e-5,
     eval_step=1,
-    early_stop_patience=10
+    early_stop_patience=10,
+    max_grad_norm=1.0,      # 梯度裁剪阈值
+    enable_grad_clip=True   # 启用梯度裁剪
 )
 
 # 6. 开始训练
@@ -117,10 +119,12 @@ trainer = Trainer(
     test_data=test_loader,
     device=DEVICE,
     epochs=30,
-    lr=5e-4,  # 更小的学习率
+    lr=1e-4,  # 进一步降低学习率：从5e-4降到1e-4，确保稳定训练
     weight_decay=1e-5,
     eval_step=1,
-    early_stop_patience=10
+    early_stop_patience=10,
+    max_grad_norm=1.0,      # 梯度裁剪阈值
+    enable_grad_clip=True   # 启用梯度裁剪
 )
 
 # 开始阶段2训练

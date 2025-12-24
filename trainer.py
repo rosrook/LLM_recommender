@@ -22,10 +22,34 @@ class Trainer:
             lr=1e-3,
             weight_decay=0,
             eval_step=1,
-            early_stop_patience=10
+            early_stop_patience=10,
+            use_multi_gpu=True  # 是否自动使用多GPU
     ):
-        self.model = model.to(device)
+        # 检测并设置设备
         self.device = device
+        self.use_multi_gpu = use_multi_gpu and device == 'cuda'
+        self.num_gpus = 0
+        
+        if self.use_multi_gpu and torch.cuda.is_available():
+            self.num_gpus = torch.cuda.device_count()
+            if self.num_gpus > 1:
+                print(f"✓ 检测到 {self.num_gpus} 张GPU，将使用 DataParallel 进行多GPU训练")
+                # 将模型移到主GPU
+                self.model = model.to(device)
+                # 使用 DataParallel 包装模型
+                self.model = nn.DataParallel(self.model)
+                self.device = device  # 主设备
+            else:
+                print(f"✓ 检测到 1 张GPU，使用单GPU训练")
+                self.model = model.to(device)
+                self.use_multi_gpu = False
+        else:
+            if device == 'cuda' and not torch.cuda.is_available():
+                print("警告: CUDA不可用，将使用CPU训练")
+                self.device = 'cpu'
+            self.model = model.to(self.device)
+            self.use_multi_gpu = False
+        
         self.epochs = epochs
         self.eval_step = eval_step
         self.early_stop_patience = early_stop_patience
@@ -36,11 +60,12 @@ class Trainer:
         self.eval_loader = eval_data
         self.test_loader = test_data
 
-        # Setup optimizer
+        # Setup optimizer (注意：如果使用DataParallel，需要访问module)
+        model_for_optimizer = self.model.module if self.use_multi_gpu else self.model
         if optimizer.lower() == 'adam':
-            self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            self.optimizer = optim.Adam(model_for_optimizer.parameters(), lr=lr, weight_decay=weight_decay)
         elif optimizer.lower() == 'sgd':
-            self.optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+            self.optimizer = optim.SGD(model_for_optimizer.parameters(), lr=lr, weight_decay=weight_decay)
         else:
             raise ValueError(f"Optimizer {optimizer} not supported")
 
@@ -109,6 +134,9 @@ class Trainer:
     def _evaluate(self, eval_loader, k=[10, 20, 50]):
         """Evaluate model on validation/test set"""
         self.model.eval()
+        
+        # 对于评估，如果使用DataParallel，需要访问module来调用recommend方法
+        model_for_eval = self.model.module if self.use_multi_gpu else self.model
 
         metrics = {
             f'NDCG@{k_}': [] for k_ in k
@@ -122,7 +150,7 @@ class Trainer:
             # Get recommendations
             scores = []
             for user in users:
-                score = self.model.recommend(user)
+                score = model_for_eval.recommend(user)
                 scores.append(score)
             scores = torch.stack(scores)
 
@@ -199,7 +227,9 @@ class Trainer:
                     self.wait_epochs = 0
 
                     if save_model:
-                        torch.save(self.model.state_dict(), model_path)
+                        # 如果使用DataParallel，保存时需要访问module
+                        model_to_save = self.model.module if self.use_multi_gpu else self.model
+                        torch.save(model_to_save.state_dict(), model_path)
                         self.best_model_path = model_path
                 else:
                     # 无提升:增加等待计数并检查是否达到早停阈值
@@ -222,7 +252,20 @@ class Trainer:
 
         # Load best model for testing
         if save_model and self.best_model_path is not None:
-            self.model.load_state_dict(torch.load(self.best_model_path))
+            # 如果使用DataParallel，加载时需要访问module
+            model_to_load = self.model.module if self.use_multi_gpu else self.model
+            # 处理可能的DataParallel保存格式（带module.前缀）
+            state_dict = torch.load(self.best_model_path, map_location=self.device)
+            # 如果保存的state_dict有module.前缀，需要去掉
+            if any(key.startswith('module.') for key in state_dict.keys()):
+                if not self.use_multi_gpu:
+                    # 单GPU加载多GPU保存的模型，需要去掉module.前缀
+                    state_dict = {k[7:] if k.startswith('module.') else k: v 
+                                 for k, v in state_dict.items()}
+            elif self.use_multi_gpu:
+                # 多GPU加载单GPU保存的模型，需要添加module.前缀
+                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+            model_to_load.load_state_dict(state_dict)
 
         # Final test evaluation
         if self.test_loader is not None:

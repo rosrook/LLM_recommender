@@ -221,7 +221,8 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
     def _get_user_metadata_embeddings(self, user_ids, training=False):
         """Get user metadata embeddings (dynamic or cached)"""
         if self.use_cache:
-            device = self.device
+            # 从 user_ids tensor 获取设备，更可靠
+            device = user_ids.device
             if self.user_metadata_embeddings.device != device:
                 self.user_metadata_embeddings = self.user_metadata_embeddings.to(device)
             return self.user_metadata_embeddings[user_ids]
@@ -236,7 +237,8 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
     def _get_item_metadata_embeddings(self, item_ids, training=False):
         """Get item metadata embeddings (dynamic or cached)"""
         if self.use_cache:
-            device = self.device
+            # 从 item_ids tensor 获取设备，更可靠
+            device = item_ids.device
             if self.item_metadata_embeddings.device != device:
                 self.item_metadata_embeddings = self.item_metadata_embeddings.to(device)
             return self.item_metadata_embeddings[item_ids]
@@ -363,7 +365,11 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
     def recommend(self, user_id, k=None, batch_size_eval=1024):
         """Generate recommendations"""
         self.eval()
-        device = self.device
+        # 从 embedding 层获取设备，避免 DataParallel 的问题
+        try:
+            device = next(self.parameters()).device
+        except (StopIteration, RuntimeError):
+            device = next(iter(self.user_embedding.parameters())).device
         
         if isinstance(user_id, torch.Tensor):
             user_idx = int(user_id.detach().cpu().item())

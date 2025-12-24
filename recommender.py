@@ -112,7 +112,12 @@ class AbstractRecommender(nn.Module, ABC):
     @property
     def device(self):
         """Get device model is on"""
-        return next(self.parameters()).device
+        try:
+            # 使用 iter() 更安全，避免 StopIteration
+            return next(iter(self.parameters())).device
+        except (StopIteration, RuntimeError):
+            # 如果遇到问题，从embedding层获取
+            return next(iter(self.user_embedding.parameters())).device
 
 
 class NCFRecommender(AbstractRecommender):

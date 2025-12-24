@@ -7,10 +7,12 @@
 2. 阶段2：精细调优（动态模式，端到端微调）
 """
 
+import torch
 from dataset import ML1MDataset
 from dataloader import TrainDataLoader, EvalDataLoader
 from gpt2_recommender_enhanced import GPT2RecommenderEnhanced
 from trainer import Trainer
+from evaluator import evaluate_model_standard
 
 # ==================== 配置参数 ====================
 DATA_PATH = '/Users/zhuxuzhou/Downloads/ml-1m'  # 修改为你的数据路径
@@ -139,4 +141,40 @@ if isinstance(result, tuple):
 else:
     valid_result = result
     print(f"Best Validation: {valid_result}")
+
+# ==================== 标准评估流程 ====================
+print("\n" + "="*60)
+print("标准评估流程（测试集）")
+print("="*60)
+print("评估标准：")
+print("  1. 对每个用户，只考虑未在训练集+验证集中交互过的item")
+print("  2. 使用模型的predict方法计算user-item分数")
+print("  3. 排序得到top K推荐")
+print("  4. 计算Recall, Precision, NDCG等指标")
+print("="*60)
+
+# 加载最佳模型（如果保存了）
+if hasattr(trainer, 'best_model_path') and trainer.best_model_path:
+    print(f"\n加载最佳模型: {trainer.best_model_path}")
+    model_to_eval = model.module if hasattr(model, 'module') else model
+    model_to_eval.load_state_dict(torch.load(trainer.best_model_path))
+    print("模型加载完成")
+
+# 执行标准评估
+standard_results = evaluate_model_standard(
+    model=model,
+    dataset=dataset,
+    train_data=train_data,
+    valid_data=valid_data,
+    test_data=test_data,
+    device=DEVICE,
+    k_list=[10, 20, 50],
+    verbose=True
+)
+
+# 保存评估结果
+import json
+with open('test_results_standard.json', 'w') as f:
+    json.dump({k: float(v) for k, v in standard_results.items()}, f, indent=2)
+print("\n评估结果已保存到: test_results_standard.json")
 

@@ -93,6 +93,52 @@ class Trainer:
                       f"已保留 {reserved:.2f}GB / "
                       f"总计 {total:.2f}GB")
             print()
+    
+    def _diagnose_slow_training(self, batch_idx, users, elapsed_time):
+        """诊断训练缓慢的原因"""
+        print(f"     - Batch索引: {batch_idx}")
+        print(f"     - Batch大小: {len(users)}")
+        print(f"     - 已耗时: {elapsed_time:.1f}秒 ({elapsed_time/60:.1f}分钟)")
+        
+        # 检查模型配置
+        if hasattr(self.model, 'module'):
+            model_check = self.model.module
+        else:
+            model_check = self.model
+        
+        if hasattr(model_check, 'use_cache'):
+            use_cache = model_check.use_cache
+            print(f"     - 缓存模式: {'是' if use_cache else '否（动态模式）'}")
+            if not use_cache:
+                print(f"       ⚠️  动态模式需要实时编码metadata，这是正常的但会很慢")
+        
+        if hasattr(model_check, 'freeze_gpt2'):
+            freeze_gpt2 = model_check.freeze_gpt2
+            print(f"     - GPT-2冻结: {'是' if freeze_gpt2 else '否（正在微调）'}")
+            if not freeze_gpt2:
+                print(f"       ⚠️  GPT-2未冻结，需要计算梯度，会增加计算时间")
+        
+        # 检查GPU使用情况
+        if torch.cuda.is_available():
+            print(f"     - GPU使用情况:")
+            for i in range(self.num_gpus):
+                memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                props = torch.cuda.get_device_properties(i)
+                memory_total = props.total_memory / 1024**3
+                print(f"       GPU {i}: 显存={memory_allocated:.2f}GB/{memory_total:.2f}GB "
+                      f"(已保留={memory_reserved:.2f}GB)")
+        
+        print(f"\n     建议：")
+        print(f"       1. 如果这是第一个batch，请继续等待（动态模式需要2-5分钟）")
+        print(f"       2. 如果持续很慢，考虑：")
+        print(f"          - 使用缓存模式（use_cache=True）")
+        print(f"          - 减少batch_size")
+        print(f"          - 冻结GPT-2（freeze_gpt2=True）")
+        print(f"       3. 如果超过10分钟仍无进展，可能是真的卡住了，请检查：")
+        print(f"          - GPU是否正常工作（nvidia-smi）")
+        print(f"          - 是否有其他进程占用GPU")
+        print(f"          - 显存是否充足")
 
     def _train_epoch(self):
         """Train model for one epoch"""
@@ -106,16 +152,50 @@ class Trainer:
         backward_time = 0
         optimizer_time = 0
 
-        for batch in self.train_loader:
+        # 添加batch级别的进度条
+        batch_iterator = tqdm(self.train_loader, desc='  Batches', leave=False, ncols=100)
+        
+        # 监测变量：用于检测训练是否卡住
+        batch_start_time = time()
+        first_batch_start_time = None
+        slow_batch_count = 0
+        batch_timeout_threshold = 300  # 5分钟超时阈值（秒）
+        slow_batch_threshold = 60  # 1分钟慢batch阈值（秒）
+        
+        for batch_idx, batch in enumerate(batch_iterator):
             batch_start = time()
             users, pos_items, neg_items = batch
             data_loading_time += time() - batch_start
 
             try:
+                # 监测：记录第一个batch的开始时间
+                if batch_idx == 0:
+                    first_batch_start_time = time()
+                    # 检查是否是动态模式（阶段2）
+                    if hasattr(self.model, 'module'):
+                        model_check = self.model.module
+                    else:
+                        model_check = self.model
+                    if hasattr(model_check, 'use_cache') and not model_check.use_cache:
+                        print(f"\n  ⚠️  检测到动态模式（阶段2），第一个batch需要编码metadata")
+                        print(f"     预计等待时间：2-5分钟，请耐心等待...")
+                
                 # Forward pass
                 forward_start = time()
                 pos_scores, neg_scores = self.model(batch)
                 forward_time += time() - forward_start
+                
+                # 监测：检查forward pass是否耗时过长
+                forward_duration = time() - forward_start
+                if forward_duration > slow_batch_threshold:
+                    slow_batch_count += 1
+                    if slow_batch_count <= 3:  # 只提示前3次
+                        print(f"\n  ⚠️  检测到慢batch（batch {batch_idx+1}，forward耗时 {forward_duration:.1f}秒）")
+                        if batch_idx == 0:
+                            print(f"     这是正常的：第一个batch需要初始化GPT-2编码器")
+                        else:
+                            print(f"     可能原因：动态模式需要编码大量metadata")
+                            print(f"     建议：如果持续很慢，考虑使用缓存模式或减少batch_size")
 
                 # Loss computation and backward pass
                 backward_start = time()
@@ -135,6 +215,26 @@ class Trainer:
 
                 total_loss += loss.item() * len(users)
                 total_samples += len(users)
+                
+                # 监测：计算整个batch的处理时间
+                batch_total_time = time() - batch_start_time
+                
+                # 监测：检查是否超时（特别是第一个batch）
+                if batch_idx == 0 and first_batch_start_time:
+                    elapsed = time() - first_batch_start_time
+                    if elapsed > batch_timeout_threshold:
+                        print(f"\n  ⚠️  第一个batch处理时间超过 {batch_timeout_threshold//60} 分钟")
+                        print(f"     当前耗时: {elapsed:.1f}秒")
+                        print(f"     诊断信息：")
+                        self._diagnose_slow_training(batch_idx, users, elapsed)
+                
+                # 更新进度条显示当前loss和batch时间
+                batch_iterator.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'time': f'{batch_total_time:.1f}s'
+                })
+                
+                batch_start_time = time()  # 重置batch开始时间
                 
             except RuntimeError as e:
                 if "out of memory" in str(e) or "CUDA out of memory" in str(e):
@@ -184,7 +284,9 @@ class Trainer:
         }
         metrics.update({f'HR@{k_}': [] for k_ in k})
 
-        for users in eval_loader:
+        # 添加评估进度条
+        eval_iterator = tqdm(eval_loader, desc='  Evaluating', leave=False, ncols=100)
+        for users in eval_iterator:
             # Get user positive items
             pos_items = eval_loader.get_user_eval_pos_items(users.cpu().numpy())
 

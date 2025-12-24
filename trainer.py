@@ -78,6 +78,16 @@ class Trainer:
         self.eval_loss_dict = defaultdict(list)
         self.best_model_path = None
         self.wait_epochs = 0
+        
+        # Loss监测配置
+        self.loss_history = []  # 记录loss历史，用于检测异常
+        self.loss_anomaly_threshold = {
+            'max_loss': 10.0,      # 最大loss阈值
+            'min_loss': 0.0,       # 最小loss阈值（BPR loss应该是正数）
+            'nan_check': True,     # 检查NaN
+            'inf_check': True,     # 检查Inf
+            'no_decrease_epochs': 10  # 连续多少epoch不下降才报警
+        }
     
     def _print_gpu_memory_info(self):
         """打印GPU显存信息"""
@@ -139,6 +149,108 @@ class Trainer:
         print(f"          - GPU是否正常工作（nvidia-smi）")
         print(f"          - 是否有其他进程占用GPU")
         print(f"          - 显存是否充足")
+    
+    def _check_loss_anomaly(self, loss_value, batch_idx, batch_size):
+        """
+        检查loss是否异常
+        
+        Args:
+            loss_value: loss值
+            batch_idx: batch索引
+            batch_size: batch大小
+        """
+        threshold = self.loss_anomaly_threshold
+        error_messages = []
+        
+        # 检查NaN
+        if threshold['nan_check'] and (torch.isnan(torch.tensor(loss_value)) or np.isnan(loss_value)):
+            error_messages.append(f"❌ 严重错误：Loss为NaN！")
+            error_messages.append(f"   Batch索引: {batch_idx}, Batch大小: {batch_size}")
+            error_messages.append(f"   可能原因：")
+            error_messages.append(f"     1. 梯度爆炸（学习率太大）")
+            error_messages.append(f"     2. 数值不稳定（模型输出异常）")
+            error_messages.append(f"     3. 数据问题（包含NaN值）")
+            error_messages.append(f"   建议：")
+            error_messages.append(f"     - 减小学习率")
+            error_messages.append(f"     - 检查输入数据")
+            error_messages.append(f"     - 添加梯度裁剪")
+            print("\n" + "\n".join(error_messages))
+            raise ValueError("Loss为NaN，训练异常终止！")
+        
+        # 检查Inf
+        if threshold['inf_check'] and (torch.isinf(torch.tensor(loss_value)) or np.isinf(loss_value)):
+            error_messages.append(f"❌ 严重错误：Loss为Inf！")
+            error_messages.append(f"   Batch索引: {batch_idx}, Batch大小: {batch_size}")
+            error_messages.append(f"   可能原因：")
+            error_messages.append(f"     1. 梯度爆炸")
+            error_messages.append(f"     2. 数值溢出")
+            error_messages.append(f"   建议：")
+            error_messages.append(f"     - 减小学习率")
+            error_messages.append(f"     - 添加梯度裁剪")
+            print("\n" + "\n".join(error_messages))
+            raise ValueError("Loss为Inf，训练异常终止！")
+        
+        # 检查loss是否异常高
+        if loss_value > threshold['max_loss']:
+            error_messages.append(f"⚠️  警告：Loss异常高！")
+            error_messages.append(f"   当前loss: {loss_value:.4f} (阈值: {threshold['max_loss']})")
+            error_messages.append(f"   Batch索引: {batch_idx}, Batch大小: {batch_size}")
+            error_messages.append(f"   可能原因：")
+            error_messages.append(f"     1. 学习率太大，导致训练不稳定")
+            error_messages.append(f"     2. 模型初始化问题")
+            error_messages.append(f"     3. 数据预处理问题")
+            error_messages.append(f"   建议：")
+            error_messages.append(f"     - 检查学习率（当前: {self.optimizer.param_groups[0]['lr']}）")
+            error_messages.append(f"     - 如果持续出现，考虑减小学习率")
+            print("\n" + "\n".join(error_messages))
+            # 不抛出异常，只警告
+        
+        # 检查loss是否为负数（BPR loss应该是正数）
+        if loss_value < threshold['min_loss']:
+            error_messages.append(f"⚠️  警告：Loss为负数！")
+            error_messages.append(f"   当前loss: {loss_value:.4f}")
+            error_messages.append(f"   Batch索引: {batch_idx}, Batch大小: {batch_size}")
+            error_messages.append(f"   可能原因：")
+            error_messages.append(f"     1. 损失函数实现问题")
+            error_messages.append(f"     2. 模型输出异常（pos_score < neg_score且差异很大）")
+            error_messages.append(f"   建议：")
+            error_messages.append(f"     - 检查损失函数实现")
+            error_messages.append(f"     - 检查模型输出")
+            print("\n" + "\n".join(error_messages))
+            # 不抛出异常，只警告
+    
+    def _check_epoch_loss_trend(self):
+        """检查epoch级别的loss趋势"""
+        if len(self.loss_history) < self.loss_anomaly_threshold['no_decrease_epochs']:
+            return
+        
+        # 检查最近N个epoch的loss是否完全不下降
+        recent_losses = self.loss_history[-self.loss_anomaly_threshold['no_decrease_epochs']:]
+        
+        # 计算loss变化
+        loss_changes = [recent_losses[i] - recent_losses[i-1] for i in range(1, len(recent_losses))]
+        
+        # 如果所有变化都>=0（即完全不下降或上升）
+        if all(change >= 0 for change in loss_changes):
+            print(f"\n⚠️  警告：连续 {self.loss_anomaly_threshold['no_decrease_epochs']} 个epoch loss不下降！")
+            print(f"   最近 {len(recent_losses)} 个epoch的loss: {[f'{l:.4f}' for l in recent_losses]}")
+            print(f"   Loss变化: {[f'{c:+.4f}' for c in loss_changes]}")
+            print(f"   可能原因：")
+            print(f"     1. 学习率太小，模型无法学习")
+            print(f"     2. 模型容量不足")
+            print(f"     3. 数据问题")
+            print(f"     4. 已经收敛（如果loss已经很低）")
+            print(f"   建议：")
+            print(f"     - 检查学习率（当前: {self.optimizer.param_groups[0]['lr']}）")
+            print(f"     - 检查验证集指标是否提升")
+            print(f"     - 如果验证集指标也不提升，考虑调整超参数")
+        
+        # 检查loss是否持续上升
+        if len(loss_changes) >= 3 and all(change > 0 for change in loss_changes[-3:]):
+            print(f"\n⚠️  警告：Loss持续上升！")
+            print(f"   最近3个epoch的loss变化: {[f'{c:+.4f}' for c in loss_changes[-3:]]}")
+            print(f"   可能原因：学习率太大，导致训练不稳定")
+            print(f"   建议：减小学习率（当前: {self.optimizer.param_groups[0]['lr']}）")
 
     def _train_epoch(self):
         """Train model for one epoch"""
@@ -213,7 +325,11 @@ class Trainer:
                 self.optimizer.step()
                 optimizer_time += time() - optimizer_start
 
-                total_loss += loss.item() * len(users)
+                # Loss监测：检查loss是否异常
+                loss_value = loss.item()
+                self._check_loss_anomaly(loss_value, batch_idx, len(users))
+                
+                total_loss += loss_value * len(users)
                 total_samples += len(users)
                 
                 # 监测：计算整个batch的处理时间
@@ -230,9 +346,14 @@ class Trainer:
                 
                 # 更新进度条显示当前loss和batch时间
                 batch_iterator.set_postfix({
-                    'loss': f'{loss.item():.4f}',
+                    'loss': f'{loss_value:.4f}',
                     'time': f'{batch_total_time:.1f}s'
                 })
+                
+                # 记录loss历史（用于epoch级别的监测）
+                if not hasattr(self, '_current_epoch_losses'):
+                    self._current_epoch_losses = []
+                self._current_epoch_losses.append(loss_value)
                 
                 batch_start_time = time()  # 重置batch开始时间
                 
@@ -269,7 +390,16 @@ class Trainer:
         #     f"\n - Total time: {data_loading_time + forward_time + backward_time + optimizer_time:.2f}s"
         # )
 
-        return total_loss / total_samples
+        avg_loss = total_loss / total_samples
+        
+        # Epoch级别的loss监测
+        if hasattr(self, '_current_epoch_losses') and len(self._current_epoch_losses) > 0:
+            self.loss_history.append(avg_loss)
+            self._check_epoch_loss_trend()
+            # 清空当前epoch的loss记录
+            self._current_epoch_losses = []
+        
+        return avg_loss
 
     @torch.no_grad()
     def _evaluate(self, eval_loader, k=[10, 20, 50]):

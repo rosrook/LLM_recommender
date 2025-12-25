@@ -97,21 +97,27 @@ else:
 
 # ==================== 阶段2：精细调优 ====================
 print("\n" + "="*60)
-print("阶段2：精细调优（动态模式，端到端微调）")
+print("阶段2：精细调优（缓存模式 + 解冻GPT-2，加速训练）")
+print("="*60)
+print("优化策略：")
+print("  1. 保持缓存模式（use_cache=True）- 避免每个batch重新编码metadata")
+print("  2. 解冻GPT-2（使用LoRA，只训练少量参数）")
+print("  3. 使用混合精度训练（FP16）加速")
 print("="*60)
 
-# 切换到动态模式
-print("\n[1/5] 切换到动态模式...")
-model.use_cache = False    # 切换到动态模式
+# 保持缓存模式，但解冻GPT-2（使用LoRA时只有少量参数需要梯度）
+print("\n[1/5] 保持缓存模式，解冻GPT-2参数...")
+# 注意：保持 use_cache=True，这样metadata embeddings是预计算的
+# 只需要计算GPT-2的梯度（如果使用LoRA，只有少量参数）
 model.freeze_gpt2 = False   # 解冻GPT-2
 
 # 重新启用梯度
-print("[2/5] 解冻GPT-2参数...")
+print("[2/5] 解冻GPT-2参数（LoRA参数）...")
 for param in model.gpt2_encoder.parameters():
     param.requires_grad = True
 
-# 重新创建训练器（使用更小的学习率）
-print("[3/5] 创建新的训练器（精细调优）...")
+# 重新创建训练器（使用更小的学习率和混合精度训练）
+print("[3/5] 创建新的训练器（精细调优 + 混合精度训练）...")
 trainer = Trainer(
     model=model,
     train_data=train_loader,
@@ -124,7 +130,8 @@ trainer = Trainer(
     eval_step=1,
     early_stop_patience=10,
     max_grad_norm=1.0,      # 梯度裁剪阈值
-    enable_grad_clip=True   # 启用梯度裁剪
+    enable_grad_clip=True,   # 启用梯度裁剪
+    use_amp=True            # 启用混合精度训练（FP16）加速
 )
 
 # 开始阶段2训练

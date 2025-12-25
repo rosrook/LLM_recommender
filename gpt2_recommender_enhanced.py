@@ -141,6 +141,9 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
             self.item_metadata_embeddings = None
             print("Using dynamic metadata extraction (end-to-end training mode)")
         
+        # 用于定期更新缓存的标志
+        self._cache_update_epoch = 0
+        
         # Projection layer to align metadata embedding dimension with embed_dim
         if self.metadata_dim != embed_dim:
             self.user_meta_proj = nn.Linear(self.metadata_dim, embed_dim)
@@ -256,6 +259,20 @@ class GPT2RecommenderEnhanced(AbstractRecommender):
         embeddings = self.gpt2_encoder.encode_text(self.item_texts)
         device = next(self.parameters()).device if len(list(self.parameters())) > 0 else 'cuda'
         return embeddings.to(device)
+    
+    def update_cache(self):
+        """
+        更新缓存的metadata embeddings（用于在训练过程中更新GPT-2的embeddings）
+        注意：只有在use_cache=True且freeze_gpt2=False时才有意义
+        """
+        if self.use_cache and not self.freeze_gpt2:
+            print("Updating cached metadata embeddings with current GPT-2 state...")
+            self.user_metadata_embeddings = self._precompute_user_metadata_embeddings()
+            self.item_metadata_embeddings = self._precompute_item_metadata_embeddings()
+            self._cache_update_epoch += 1
+            print(f"Cache updated (update count: {self._cache_update_epoch})")
+        else:
+            print("Warning: update_cache() called but use_cache=False or freeze_gpt2=True")
     
     def _get_user_metadata_embeddings(self, user_ids, training=False):
         """Get user metadata embeddings (dynamic or cached)"""

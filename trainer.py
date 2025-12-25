@@ -30,7 +30,8 @@ class Trainer:
             scheduler_mode='min',  # 'min'表示监控loss（越小越好），'max'表示监控指标（越大越好）
             scheduler_factor=0.5,  # 学习率衰减因子
             scheduler_patience=3,  # 多少个epoch不改善就减小学习率
-            scheduler_min_lr=1e-6  # 最小学习率
+            scheduler_min_lr=1e-6,  # 最小学习率
+            use_amp=False  # 是否使用混合精度训练（FP16）加速
     ):
         # 检测并设置设备
         self.device = device
@@ -110,6 +111,15 @@ class Trainer:
         # 梯度裁剪配置
         self.max_grad_norm = max_grad_norm
         self.enable_grad_clip = enable_grad_clip
+        
+        # 混合精度训练配置
+        self.use_amp = use_amp and device == 'cuda' and torch.cuda.is_available()
+        if self.use_amp:
+            from torch.cuda.amp import autocast, GradScaler
+            self.scaler = GradScaler()
+            print("✓ 已启用混合精度训练（FP16）加速")
+        else:
+            self.scaler = None
         
         # Loss监测配置
         self.loss_history = []  # 记录loss历史，用于检测异常
@@ -309,6 +319,12 @@ class Trainer:
         """
         检查模型输出是否正常
         
+        这个检查在batch 0和每100个batch时执行，用于：
+        1. 检测模型输出是否合理（正样本分数应该 > 负样本分数）
+        2. 检测分数差异是否足够大（模型能否区分正负样本）
+        3. 检测分数是否在合理范围内
+        4. 在训练早期发现问题，避免浪费时间训练有问题的模型
+        
         Args:
             pos_scores: 正样本分数
             neg_scores: 负样本分数
@@ -334,20 +350,44 @@ class Trainer:
             
             # 检查异常情况
             warnings = []
+            is_initial_batch = (batch_idx == 0)
+            
+            # 对于batch 0，使用更宽松的阈值（因为模型刚初始化，输出接近0是正常的）
+            # 对于后续batch，使用更严格的阈值
             
             # 检查1: pos_score是否小于neg_score（这是不正常的）
+            # 对于batch 0，只检查是否有明显的问题（差异 > 0.001）
             if pos_mean < neg_mean:
-                warnings.append(f"⚠️  异常：正样本分数({pos_mean:.4f}) < 负样本分数({neg_mean:.4f})")
-                warnings.append(f"     这意味着模型预测错误，loss会持续上升")
-                warnings.append(f"     可能原因：")
-                warnings.append(f"       1. 模型初始化问题")
-                warnings.append(f"       2. 学习率太大，导致模型无法学习正确方向")
-                warnings.append(f"       3. 数据标签问题")
+                if is_initial_batch:
+                    # Batch 0时，如果差异很小（可能是数值误差），只给出提示
+                    if abs(diff_mean) < 0.001:
+                        warnings.append(f"ℹ️  Batch 0: 模型刚初始化，输出接近0是正常的")
+                        warnings.append(f"     正样本分数: {pos_mean:.6f}, 负样本分数: {neg_mean:.6f}")
+                        warnings.append(f"     分数差异: {diff_mean:.6f} (数值误差范围内)")
+                        warnings.append(f"     模型将在训练过程中学习区分正负样本")
+                    else:
+                        # 如果差异较大，说明确实有问题
+                        warnings.append(f"⚠️  异常：正样本分数({pos_mean:.4f}) < 负样本分数({neg_mean:.4f})")
+                        warnings.append(f"     这意味着模型预测错误，loss会持续上升")
+                        warnings.append(f"     可能原因：模型初始化问题")
+                else:
+                    # 后续batch，这是严重问题
+                    warnings.append(f"⚠️  异常：正样本分数({pos_mean:.4f}) < 负样本分数({neg_mean:.4f})")
+                    warnings.append(f"     这意味着模型预测错误，loss会持续上升")
+                    warnings.append(f"     可能原因：")
+                    warnings.append(f"       1. 学习率太大，导致模型无法学习正确方向")
+                    warnings.append(f"       2. 模型初始化问题")
+                    warnings.append(f"       3. 数据标签问题")
             
             # 检查2: 分数差异是否太小
-            if diff_mean < 0.1:
-                warnings.append(f"⚠️  警告：正负样本分数差异很小({diff_mean:.4f})")
-                warnings.append(f"     模型可能无法区分正负样本")
+            # 对于batch 0，使用更宽松的阈值
+            diff_threshold = 0.001 if is_initial_batch else 0.1
+            if abs(diff_mean) < diff_threshold:
+                if is_initial_batch:
+                    warnings.append(f"ℹ️  Batch 0: 分数差异很小({diff_mean:.6f})，这是正常的（模型刚初始化）")
+                else:
+                    warnings.append(f"⚠️  警告：正负样本分数差异很小({diff_mean:.4f})")
+                    warnings.append(f"     模型可能无法区分正负样本")
             
             # 检查3: 分数是否在合理范围内（BPR通常期望分数在合理范围）
             if pos_mean < -10 or pos_mean > 10:
@@ -356,14 +396,17 @@ class Trainer:
             if neg_mean < -10 or neg_mean > 10:
                 warnings.append(f"⚠️  警告：负样本分数异常({neg_mean:.4f})，可能超出合理范围")
             
-            # 输出警告
-            if warnings:
+            # 输出警告（batch 0时，即使只是信息性提示也输出，让用户知道检查正常）
+            if warnings or is_initial_batch:
                 print(f"\n  Batch {batch_idx} 模型输出检查：")
-                print(f"    正样本分数: mean={pos_mean:.4f}, std={pos_std:.4f}")
-                print(f"    负样本分数: mean={neg_mean:.4f}, std={neg_std:.4f}")
-                print(f"    分数差异: {diff_mean:.4f}")
-                for warning in warnings:
-                    print(f"    {warning}")
+                print(f"    正样本分数: mean={pos_mean:.6f}, std={pos_std:.6f}")
+                print(f"    负样本分数: mean={neg_mean:.6f}, std={neg_std:.6f}")
+                print(f"    分数差异: {diff_mean:.6f}")
+                if warnings:
+                    for warning in warnings:
+                        print(f"    {warning}")
+                elif is_initial_batch:
+                    print(f"    ✓ 模型输出正常（初始化阶段，输出接近0是正常的）")
     
     def _check_epoch_loss_trend(self):
         """检查epoch级别的loss趋势"""
@@ -481,9 +524,14 @@ class Trainer:
                         print(f"\n  ⚠️  检测到动态模式（阶段2），第一个batch需要编码metadata")
                         print(f"     预计等待时间：2-5分钟，请耐心等待...")
                 
-                # Forward pass
+                # Forward pass (with mixed precision if enabled)
                 forward_start = time()
-                pos_scores, neg_scores = self.model(batch)
+                if self.use_amp:
+                    from torch.cuda.amp import autocast
+                    with autocast():
+                        pos_scores, neg_scores = self.model(batch)
+                else:
+                    pos_scores, neg_scores = self.model(batch)
                 forward_time += time() - forward_start
                 
                 # 监测：检查forward pass是否耗时过长
@@ -509,20 +557,39 @@ class Trainer:
                     loss = -(pos_scores - neg_scores).sigmoid().log().mean()
                 backward_time += time() - backward_start
 
-                # Optimizer step
+                # Optimizer step (with mixed precision if enabled)
                 optimizer_start = time()
                 self.optimizer.zero_grad()
-                loss.backward()
                 
-                # 梯度监测和裁剪
-                grad_norm = self._monitor_and_clip_gradients(batch_idx)
-                self.grad_norm_history.append(grad_norm)
-                
-                # 检查模型输出（pos_score vs neg_score）
-                if batch_idx == 0 or batch_idx % 100 == 0:  # 每100个batch检查一次
-                    self._check_model_outputs(pos_scores, neg_scores, batch_idx)
-                
-                self.optimizer.step()
+                if self.use_amp:
+                    # 使用scaler进行反向传播
+                    self.scaler.scale(loss).backward()
+                    
+                    # 梯度监测和裁剪（需要在scaler之前进行）
+                    # 注意：在混合精度训练中，梯度需要先unscale
+                    self.scaler.unscale_(self.optimizer)
+                    grad_norm = self._monitor_and_clip_gradients(batch_idx)
+                    self.grad_norm_history.append(grad_norm)
+                    
+                    # 检查模型输出（pos_score vs neg_score）
+                    if batch_idx == 0 or batch_idx % 100 == 0:  # 每100个batch检查一次
+                        self._check_model_outputs(pos_scores, neg_scores, batch_idx)
+                    
+                    # 使用scaler进行优化器更新
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    
+                    # 梯度监测和裁剪
+                    grad_norm = self._monitor_and_clip_gradients(batch_idx)
+                    self.grad_norm_history.append(grad_norm)
+                    
+                    # 检查模型输出（pos_score vs neg_score）
+                    if batch_idx == 0 or batch_idx % 100 == 0:  # 每100个batch检查一次
+                        self._check_model_outputs(pos_scores, neg_scores, batch_idx)
+                    
+                    self.optimizer.step()
                 optimizer_time += time() - optimizer_start
 
                 # Loss监测：检查loss是否异常

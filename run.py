@@ -8,6 +8,7 @@
 """
 
 import torch
+import torch.optim as optim
 from dataset import ML1MDataset
 from dataloader import TrainDataLoader, EvalDataLoader
 from gpt2_recommender_enhanced import GPT2RecommenderEnhanced
@@ -102,7 +103,8 @@ print("="*60)
 print("优化策略：")
 print("  1. 保持缓存模式（use_cache=True）- 避免每个batch重新编码metadata")
 print("  2. 解冻GPT-2（使用LoRA，只训练少量参数）")
-print("  3. 使用混合精度训练（FP16）加速")
+print("  3. 分层学习率：GPT-2参数使用更小学习率（1e-5），其他参数5e-5")
+print("  4. 更严格的梯度裁剪（max_grad_norm=0.5）避免梯度爆炸")
 print("="*60)
 
 # 保持缓存模式，但解冻GPT-2（使用LoRA时只有少量参数需要梯度）
@@ -116,8 +118,9 @@ print("[2/5] 解冻GPT-2参数（LoRA参数）...")
 for param in model.gpt2_encoder.parameters():
     param.requires_grad = True
 
-# 重新创建训练器（使用更小的学习率和混合精度训练）
-print("[3/5] 创建新的训练器（精细调优 + 混合精度训练）...")
+# 重新创建训练器（使用分层学习率和更严格的梯度裁剪）
+print("[3/5] 创建新的训练器（精细调优 + 分层学习率）...")
+# 使用更小的学习率和更严格的梯度裁剪，避免Loss为Inf
 trainer = Trainer(
     model=model,
     train_data=train_loader,
@@ -125,17 +128,43 @@ trainer = Trainer(
     test_data=test_loader,
     device=DEVICE,
     epochs=30,
-    lr=1e-4,  # 进一步降低学习率：从5e-4降到1e-4，确保稳定训练
+    lr=5e-5,  # 大幅降低基础学习率：从1e-4降到5e-5，避免数值溢出
     weight_decay=1e-5,
     eval_step=1,
     early_stop_patience=10,
-    max_grad_norm=1.0,      # 梯度裁剪阈值
+    max_grad_norm=0.5,      # 更严格的梯度裁剪阈值：从1.0降到0.5
     enable_grad_clip=True,   # 启用梯度裁剪
-    use_amp=True            # 启用混合精度训练（FP16）加速
+    use_amp=False           # 暂时禁用混合精度训练，避免数值不稳定
 )
 
+# 手动设置分层学习率：GPT-2参数使用更小的学习率
+print("[4/5] 设置分层学习率（GPT-2参数使用更小学习率）...")
+model_for_optimizer = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+
+# 分离GPT-2参数和其他参数
+gpt2_params = []
+other_params = []
+for name, param in model_for_optimizer.named_parameters():
+    if param.requires_grad:
+        if 'gpt2_encoder' in name:
+            gpt2_params.append(param)
+        else:
+            other_params.append(param)
+
+# 重新创建optimizer，GPT-2参数使用更小的学习率
+trainer.optimizer = optim.Adam(
+    [
+        {'params': gpt2_params, 'lr': 1e-5, 'weight_decay': 1e-5},  # GPT-2参数：非常小的学习率
+        {'params': other_params, 'lr': 5e-5, 'weight_decay': 1e-5}  # 其他参数：稍大的学习率
+    ]
+)
+print(f"  ✓ 分层学习率设置完成:")
+print(f"    GPT-2参数学习率: 1e-5")
+print(f"    其他参数学习率: 5e-5")
+print(f"    梯度裁剪阈值: 0.5")
+
 # 开始阶段2训练
-print("[4/5] 开始阶段2训练...")
+print("[5/5] 开始阶段2训练...")
 result = trainer.fit(
     save_model=True, 
     model_path='gpt2_recommender_enhanced.pth'

@@ -818,15 +818,13 @@ class Trainer:
             model_to_load = self.model.module if self.use_multi_gpu else self.model
             # 处理可能的DataParallel保存格式（带module.前缀）
             state_dict = torch.load(self.best_model_path, map_location=self.device)
-            # 如果保存的state_dict有module.前缀，需要去掉
+            # 统一处理：无论当前是否使用多GPU，model_to_load都不应该有module.前缀
+            # 所以如果state_dict有module.前缀，一律去掉
             if any(key.startswith('module.') for key in state_dict.keys()):
-                if not self.use_multi_gpu:
-                    # 单GPU加载多GPU保存的模型，需要去掉module.前缀
-                    state_dict = {k[7:] if k.startswith('module.') else k: v 
-                                 for k, v in state_dict.items()}
-            elif self.use_multi_gpu:
-                # 多GPU加载单GPU保存的模型，需要添加module.前缀
-                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+                # 去掉所有module.前缀
+                state_dict = {k[7:] if k.startswith('module.') else k: v 
+                             for k, v in state_dict.items()}
+                self.logger.info("检测到保存的模型使用了DataParallel格式（带module.前缀），已自动去除")
             
             # 使用 strict=False 允许部分加载，并报告缺失和多余的键
             missing_keys, unexpected_keys = model_to_load.load_state_dict(state_dict, strict=False)

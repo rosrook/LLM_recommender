@@ -16,7 +16,7 @@ from trainer import Trainer
 from evaluator import evaluate_model_standard
 
 # ==================== 配置参数 ====================
-DATA_PATH = '/Users/zhuxuzhou/Downloads/ml-1m'  # 修改为你的数据路径
+DATA_PATH = '/home/zhuxuzhou/LLM_recommender/data/ml-1m'  # 修改为你的数据路径
 DEVICE = 'cuda'  # 或 'cpu'
 BATCH_SIZE = 2048
 EMBED_DIM = 64
@@ -200,10 +200,12 @@ if hasattr(trainer, 'best_model_path') and trainer.best_model_path:
     state_dict = torch.load(trainer.best_model_path, map_location=DEVICE)
     
     # 处理可能的DataParallel保存格式
+    # 无论当前模型是否使用DataParallel，model_to_eval都不应该有module.前缀
+    # 所以如果state_dict有module.前缀，一律去掉
     if any(key.startswith('module.') for key in state_dict.keys()):
-        if not hasattr(model, 'module'):
-            state_dict = {k[7:] if k.startswith('module.') else k: v 
-                         for k, v in state_dict.items()}
+        state_dict = {k[7:] if k.startswith('module.') else k: v 
+                     for k, v in state_dict.items()}
+        print("  检测到保存的模型使用了DataParallel格式（带module.前缀），已自动去除")
     
     # 使用 strict=False 允许部分加载
     missing_keys, unexpected_keys = model_to_eval.load_state_dict(state_dict, strict=False)

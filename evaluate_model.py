@@ -54,7 +54,7 @@ def main():
   # 指定所有参数
   python evaluate_model.py \\
       --model_path gpt2_recommender_enhanced.pth \\
-      --data_path /Users/zhuxuzhou/Downloads/ml-1m \\
+      --data_path /home/zhuxuzhou/LLM_recommender/data/ml-1m \\
       --device cuda \\
       --embed_dim 64 \\
       --use_cache \\
@@ -65,8 +65,8 @@ def main():
     )
     parser.add_argument('--model_path', type=str, required=True,
                        help='模型权重文件路径（必需）')
-    parser.add_argument('--data_path', type=str, default='/Users/zhuxuzhou/Downloads/ml-1m',
-                       help='数据集路径（默认: /Users/zhuxuzhou/Downloads/ml-1m）')
+    parser.add_argument('--data_path', type=str, default='/home/zhuxuzhou/LLM_recommender/data/ml-1m',
+                       help='数据集路径（默认: /home/zhuxuzhou/LLM_recommender/data/ml-1m）')
     parser.add_argument('--device', type=str, default='cuda',
                        choices=['cuda', 'cpu'],
                        help='设备 (cuda/cpu，默认: cuda)')

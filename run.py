@@ -197,8 +197,31 @@ print("="*60)
 if hasattr(trainer, 'best_model_path') and trainer.best_model_path:
     print(f"\n加载最佳模型: {trainer.best_model_path}")
     model_to_eval = model.module if hasattr(model, 'module') else model
-    model_to_eval.load_state_dict(torch.load(trainer.best_model_path))
-    print("模型加载完成")
+    state_dict = torch.load(trainer.best_model_path, map_location=DEVICE)
+    
+    # 处理可能的DataParallel保存格式
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        if not hasattr(model, 'module'):
+            state_dict = {k[7:] if k.startswith('module.') else k: v 
+                         for k, v in state_dict.items()}
+    
+    # 使用 strict=False 允许部分加载
+    missing_keys, unexpected_keys = model_to_eval.load_state_dict(state_dict, strict=False)
+    
+    if missing_keys:
+        print(f"⚠️  警告: 加载模型时缺失以下键（共{len(missing_keys)}个）: {missing_keys[:5]}")
+        if len(missing_keys) > 5:
+            print(f"    ... 还有 {len(missing_keys) - 5} 个缺失的键")
+    
+    if unexpected_keys:
+        print(f"⚠️  警告: 加载模型时发现意外的键（共{len(unexpected_keys)}个）: {unexpected_keys[:5]}")
+        if len(unexpected_keys) > 5:
+            print(f"    ... 还有 {len(unexpected_keys) - 5} 个意外的键")
+    
+    if not missing_keys and not unexpected_keys:
+        print("✓ 模型加载完成（完全匹配）")
+    else:
+        print(f"✓ 模型加载完成（部分匹配：缺失{len(missing_keys)}个，多余{len(unexpected_keys)}个）")
 
 # 执行标准评估
 standard_results = evaluate_model_standard(

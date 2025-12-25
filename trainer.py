@@ -827,7 +827,24 @@ class Trainer:
             elif self.use_multi_gpu:
                 # 多GPU加载单GPU保存的模型，需要添加module.前缀
                 state_dict = {'module.' + k: v for k, v in state_dict.items()}
-            model_to_load.load_state_dict(state_dict)
+            
+            # 使用 strict=False 允许部分加载，并报告缺失和多余的键
+            missing_keys, unexpected_keys = model_to_load.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                self.logger.warning(f"加载模型时缺失以下键（共{len(missing_keys)}个）: {missing_keys[:10]}")
+                if len(missing_keys) > 10:
+                    self.logger.warning(f"  ... 还有 {len(missing_keys) - 10} 个缺失的键")
+            
+            if unexpected_keys:
+                self.logger.warning(f"加载模型时发现意外的键（共{len(unexpected_keys)}个）: {unexpected_keys[:10]}")
+                if len(unexpected_keys) > 10:
+                    self.logger.warning(f"  ... 还有 {len(unexpected_keys) - 10} 个意外的键")
+            
+            if not missing_keys and not unexpected_keys:
+                self.logger.info("模型权重加载成功（完全匹配）")
+            else:
+                self.logger.info(f"模型权重加载完成（部分匹配：缺失{len(missing_keys)}个，多余{len(unexpected_keys)}个）")
 
         # Final test evaluation
         if self.test_loader is not None:
